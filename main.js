@@ -8076,6 +8076,254 @@ async function replyToThread(app, secretName, documentContentId, parentId, body)
 
 // src/view/CommentsView.ts
 var import_obsidian4 = require("obsidian");
+
+// src/anchors.ts
+function toLinearQuote(selection) {
+  return projectMarkdown(selection).text.trim();
+}
+function normalizeQuoteText(text) {
+  let normalized = "";
+  for (let i = 0; i < text.length; i++) {
+    normalized += normalizeCharacter(text[i]);
+  }
+  return normalized;
+}
+function findAllInMarkdown(raw, quote) {
+  const needle = normalizeQuoteText(quote);
+  if (needle.length === 0) return [];
+  const projection = projectMarkdown(raw);
+  const matches = /* @__PURE__ */ new Map();
+  let verbatimFrom = 0;
+  for (; ; ) {
+    const index = raw.indexOf(quote, verbatimFrom);
+    if (index === -1) break;
+    const match = { from: index, to: index + quote.length };
+    matches.set(match.to, match);
+    verbatimFrom = index + 1;
+  }
+  let searchFrom = 0;
+  for (; ; ) {
+    const index = projection.text.indexOf(needle, searchFrom);
+    if (index === -1) {
+      return [...matches.values()].sort((left, right) => left.from - right.from);
+    }
+    const from2 = projection.rawStarts[index];
+    const to = projection.rawEnds[index + needle.length - 1];
+    if (from2 !== void 0 && to !== void 0) {
+      const existing = matches.get(to);
+      matches.set(to, {
+        from: existing === void 0 ? from2 : Math.min(existing.from, from2),
+        to
+      });
+    }
+    searchFrom = index + 1;
+  }
+}
+function offsetToPosition(content, offset) {
+  const clamped = Math.max(0, Math.min(offset, content.length));
+  let line = 0;
+  let lineStart = 0;
+  for (let i = 0; i < clamped; i++) {
+    if (content[i] === "\n") {
+      line++;
+      lineStart = i + 1;
+    }
+  }
+  return { line, ch: clamped - lineStart };
+}
+function projectMarkdown(raw) {
+  let text = "";
+  const rawStarts = [];
+  const rawEnds = [];
+  const closingDelimiters = /* @__PURE__ */ new Map();
+  let index = 0;
+  while (index < raw.length) {
+    const character = raw[index];
+    if (character === "\\" && index + 1 < raw.length) {
+      text += normalizeCharacter(raw[index + 1]);
+      rawStarts.push(index);
+      rawEnds.push(index + 2);
+      index += 2;
+      continue;
+    }
+    const matchedClose = closingDelimiters.get(index);
+    if (matchedClose !== void 0) {
+      index += matchedClose;
+      continue;
+    }
+    if (character === "`" || character === "*" || character === "_") {
+      const runLength = delimiterRunLength(raw, index, character);
+      const close = findClosingDelimiter(raw, index, character, runLength);
+      if (close !== -1) {
+        closingDelimiters.set(close, runLength);
+        index += runLength;
+        continue;
+      }
+      for (let runIndex = 0; runIndex < runLength; runIndex++) {
+        text += character;
+        rawStarts.push(index + runIndex);
+        rawEnds.push(index + runIndex + 1);
+      }
+      index += runLength;
+      continue;
+    }
+    text += normalizeCharacter(character);
+    rawStarts.push(index);
+    rawEnds.push(index + 1);
+    index++;
+  }
+  return { text, rawStarts, rawEnds };
+}
+function delimiterRunLength(text, start, delimiter) {
+  let end = start;
+  while (end < text.length && text[end] === delimiter) end++;
+  return end - start;
+}
+function findClosingDelimiter(text, open, delimiter, runLength) {
+  if (delimiter !== "`" && runLength > 3) return -1;
+  if (delimiter !== "`" && isWhitespace(text[open + runLength])) return -1;
+  if (delimiter === "_" && isWordCharacter(text[open - 1])) return -1;
+  for (let index = open + runLength; index < text.length; index++) {
+    if (text[index] === "\\") {
+      index++;
+      continue;
+    }
+    if (text[index] !== delimiter) continue;
+    const candidateLength = delimiterRunLength(text, index, delimiter);
+    if (candidateLength !== runLength) {
+      index += candidateLength - 1;
+      continue;
+    }
+    if (delimiter !== "`" && isWhitespace(text[index - 1])) continue;
+    if (delimiter === "_" && isWordCharacter(text[index + candidateLength])) continue;
+    return index;
+  }
+  return -1;
+}
+function isWhitespace(character) {
+  return character === void 0 || /\s/.test(character);
+}
+function isWordCharacter(character) {
+  return character !== void 0 && /[\p{L}\p{N}]/u.test(character);
+}
+function normalizeCharacter(character) {
+  switch (character) {
+    case "\u2018":
+    // ‘
+    case "\u2019":
+    // ’
+    case "\u201B":
+      return "'";
+    case "\u201C":
+    // “
+    case "\u201D":
+    // ”
+    case "\u201F":
+      return '"';
+    case "\u2013":
+    // – en dash
+    case "\u2014":
+      return "-";
+    case "\u2026":
+      return ".";
+    default:
+      return character;
+  }
+}
+
+// src/threads.ts
+function groupComments(comments) {
+  const byId = new Map(comments.map((comment) => [comment.id, comment]));
+  const threads = /* @__PURE__ */ new Map();
+  for (const comment of comments) {
+    if (comment.parentId === null || !byId.has(comment.parentId)) {
+      threads.set(comment.id, makeThread(comment));
+    }
+  }
+  for (const comment of comments) {
+    if (comment.parentId === null) continue;
+    const parentThread = threads.get(comment.parentId);
+    if (parentThread === void 0) {
+      if (!threads.has(comment.id)) threads.set(comment.id, makeThread(comment));
+      continue;
+    }
+    parentThread.replies.push(comment);
+  }
+  const all2 = [...threads.values()];
+  for (const thread of all2) {
+    thread.replies.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  }
+  all2.sort((left, right) => right.root.createdAt.localeCompare(left.root.createdAt));
+  return {
+    inline: all2.filter((thread) => thread.kind === "inline"),
+    discussion: all2.filter((thread) => thread.kind === "discussion")
+  };
+}
+function addThread(grouped, comment) {
+  const thread = makeThread(comment);
+  if (thread.kind === "inline") {
+    return { ...grouped, inline: sortInlineThreads([thread, ...grouped.inline]) };
+  }
+  return {
+    ...grouped,
+    discussion: sortDiscussionThreads([thread, ...grouped.discussion])
+  };
+}
+function addReply(grouped, parentId, reply) {
+  const inlineIndex = grouped.inline.findIndex(
+    (thread) => thread.root.id === parentId
+  );
+  if (inlineIndex !== -1) {
+    const inline = [...grouped.inline];
+    inline[inlineIndex] = {
+      ...inline[inlineIndex],
+      replies: sortReplies([...inline[inlineIndex].replies, reply])
+    };
+    return { ...grouped, inline };
+  }
+  const discussionIndex = grouped.discussion.findIndex(
+    (thread) => thread.root.id === parentId
+  );
+  if (discussionIndex === -1) return null;
+  const discussion = [...grouped.discussion];
+  discussion[discussionIndex] = {
+    ...discussion[discussionIndex],
+    replies: sortReplies([...discussion[discussionIndex].replies, reply])
+  };
+  return { ...grouped, discussion };
+}
+function makeThread(comment) {
+  const quotedText = comment.quotedText;
+  if (quotedText !== null) {
+    return {
+      kind: "inline",
+      root: { ...comment, quotedText },
+      replies: []
+    };
+  }
+  return {
+    kind: "discussion",
+    root: { ...comment, quotedText: null },
+    replies: []
+  };
+}
+function sortInlineThreads(threads) {
+  return threads.sort(
+    (left, right) => right.root.createdAt.localeCompare(left.root.createdAt)
+  );
+}
+function sortDiscussionThreads(threads) {
+  return threads.sort(
+    (left, right) => right.root.createdAt.localeCompare(left.root.createdAt)
+  );
+}
+function sortReplies(replies) {
+  return replies.sort(
+    (left, right) => left.createdAt.localeCompare(right.createdAt)
+  );
+}
+
+// src/view/CommentsView.ts
 function errorMessage(e) {
   return e instanceof Error ? e.message : String(e);
 }
@@ -8132,108 +8380,6 @@ function formatTimestamp(iso) {
   }
   return d.toLocaleString();
 }
-function normalizeChar(ch) {
-  switch (ch) {
-    case "\u2018":
-    // ‘
-    case "\u2019":
-    // ’
-    case "\u201B":
-      return "'";
-    case "\u201C":
-    // “
-    case "\u201D":
-    // ”
-    case "\u201F":
-      return '"';
-    case "\u2013":
-    // – en dash
-    case "\u2014":
-      return "-";
-    case "\u2026":
-      return ".";
-    default:
-      return ch;
-  }
-}
-function buildStripped(raw) {
-  let stripped = "";
-  const rawOffsets = [];
-  let i = 0;
-  const n = raw.length;
-  while (i < n) {
-    const ch = raw[i];
-    if (ch === "`") {
-      let j = i + 1;
-      while (j < n && raw[j] === "`") {
-        j++;
-      }
-      i = j;
-      continue;
-    }
-    if (ch === "*" || ch === "_") {
-      let j = i + 1;
-      while (j < n && raw[j] === ch && j - i < 3) {
-        j++;
-      }
-      i = j;
-      continue;
-    }
-    if (ch === "\\" && i + 1 < n) {
-      const next = normalizeChar(raw[i + 1]);
-      stripped += next;
-      rawOffsets.push(i);
-      i += 2;
-      continue;
-    }
-    stripped += normalizeChar(ch);
-    rawOffsets.push(i);
-    i++;
-  }
-  rawOffsets.push(n);
-  return { stripped, rawOffsets };
-}
-function findAllInMarkdown(raw, needle) {
-  if (needle.length === 0) {
-    return [];
-  }
-  const verbatim = [];
-  let searchFrom = 0;
-  for (; ; ) {
-    const at = raw.indexOf(needle, searchFrom);
-    if (at === -1) {
-      break;
-    }
-    verbatim.push({ from: at, to: at + needle.length });
-    searchFrom = at + needle.length;
-  }
-  if (verbatim.length > 0) {
-    return verbatim;
-  }
-  const { stripped, rawOffsets } = buildStripped(raw);
-  let normalizedNeedle = "";
-  for (const ch of needle) {
-    normalizedNeedle += normalizeChar(ch);
-  }
-  if (normalizedNeedle.length === 0) {
-    return [];
-  }
-  const matches = [];
-  let strippedFrom = 0;
-  for (; ; ) {
-    const idx = stripped.indexOf(normalizedNeedle, strippedFrom);
-    if (idx === -1) {
-      break;
-    }
-    const from2 = rawOffsets[idx];
-    const to = rawOffsets[idx + normalizedNeedle.length];
-    if (from2 !== void 0 && to !== void 0) {
-      matches.push({ from: from2, to });
-    }
-    strippedFrom = idx + normalizedNeedle.length;
-  }
-  return matches;
-}
 function findAllInRenderedText(container, needle) {
   if (needle.length === 0) {
     return [];
@@ -8282,22 +8428,12 @@ function findAllInRenderedText(container, needle) {
       if (range !== null) {
         ranges.push(range);
       }
-      searchFrom = at + term.length;
+      searchFrom = at + 1;
     }
     return ranges;
   }
-  const verbatim = collect(text, needle);
-  if (verbatim.length > 0) {
-    return verbatim;
-  }
-  let normalizedText = "";
-  for (const ch of text) {
-    normalizedText += normalizeChar(ch);
-  }
-  let normalizedNeedle = "";
-  for (const ch of needle) {
-    normalizedNeedle += normalizeChar(ch);
-  }
+  const normalizedText = normalizeQuoteText(text);
+  const normalizedNeedle = normalizeQuoteText(needle);
   if (normalizedNeedle.length === 0) {
     return [];
   }
@@ -8339,12 +8475,17 @@ var CommentsView = class extends import_obsidian4.ItemView {
     this.bodyEl = null;
     this.imageDisposers = [];
     this.headerTitleEl = null;
+    /** Last markdown leaf focused before the comments panel took focus. */
+    this.lastMarkdownLeaf = null;
     /**
      * Raw markdown of the active note captured at the last refresh. Occurrence
      * counts and click navigation both resolve against this snapshot so they stay
      * consistent between the rendered badges and clicks. Refreshed by `refresh()`.
      */
     this.noteContentSnapshot = null;
+    /** Plain-text quote captured from the active editor for a pending inline comment. */
+    this.pendingInlineQuote = null;
+    this.pendingInlineFilePath = null;
     /**
      * Next occurrence index to reveal for a given inline comment, keyed by comment
      * id. Advances (and wraps) on each click so repeated clicks cycle through all
@@ -8401,6 +8542,17 @@ var CommentsView = class extends import_obsidian4.ItemView {
     return "message-square";
   }
   async onOpen() {
+    const activeLeaf = this.host.app.workspace.activeLeaf;
+    if (activeLeaf?.view instanceof import_obsidian4.MarkdownView) {
+      this.lastMarkdownLeaf = activeLeaf;
+    }
+    this.registerEvent(
+      this.host.app.workspace.on("active-leaf-change", (leaf) => {
+        if (leaf?.view instanceof import_obsidian4.MarkdownView) {
+          this.lastMarkdownLeaf = leaf;
+        }
+      })
+    );
     this.renderShell();
     await this.refresh();
   }
@@ -8445,6 +8597,18 @@ var CommentsView = class extends import_obsidian4.ItemView {
     newBtn.addEventListener("click", () => {
       this.focusNewThreadComposer();
     });
+    const selectionBtn = actions.createEl("button", {
+      cls: "lsr-btn lsr-selection-comment-btn",
+      attr: {
+        "aria-label": "Comment on selection",
+        title: "Comment on selection",
+        type: "button"
+      }
+    });
+    (0, import_obsidian4.setIcon)(selectionBtn, "message-square-plus");
+    selectionBtn.addEventListener("click", () => {
+      void this.openSelectionComposer();
+    });
     this.filterBarEl = sticky.createDiv({ cls: "lsr-filter-bar" });
     this.bodyEl = root.createDiv({ cls: "lsr-body" });
   }
@@ -8460,6 +8624,8 @@ var CommentsView = class extends import_obsidian4.ItemView {
     this.clearImagePreviews();
     body.empty();
     this.noteContentSnapshot = null;
+    this.pendingInlineQuote = null;
+    this.pendingInlineFilePath = null;
     this.occurrenceIndex.clear();
     this.activePreviewHighlightWatcher?.disconnect();
     this.activePreviewHighlightWatcher = null;
@@ -8514,7 +8680,7 @@ var CommentsView = class extends import_obsidian4.ItemView {
         );
       }
     }
-    this.lastThreads = this.groupComments(comments);
+    this.lastThreads = groupComments(comments);
     this.lastCtx = ctx;
     this.renderFilterBar();
     this.renderFilteredBody();
@@ -8679,67 +8845,13 @@ var CommentsView = class extends import_obsidian4.ItemView {
     this.renderInlineSection(body, inline, ctx, this.noteContentSnapshot);
     this.renderDiscussionSection(body, discussion, ctx);
   }
-  /**
-   * Group a flat list of comments into inline/discussion threads.
-   *
-   * - Roots are comments with parentId === null (or whose parent is missing
-   *   from the set, treated defensively as their own root).
-   * - Replies attach to the root referenced by parentId.
-   * - Replies are sorted by createdAt ascending; threads by root.createdAt
-   *   descending.
-   */
-  groupComments(comments) {
-    const byId = /* @__PURE__ */ new Map();
-    for (const c of comments) {
-      byId.set(c.id, c);
-    }
-    const threads = /* @__PURE__ */ new Map();
-    for (const c of comments) {
-      const isRoot = c.parentId === null || !byId.has(c.parentId);
-      if (isRoot) {
-        threads.set(c.id, {
-          root: c,
-          replies: [],
-          isInline: c.quotedText !== null
-        });
-      }
-    }
-    for (const c of comments) {
-      if (c.parentId === null) {
-        continue;
-      }
-      const parentThread = threads.get(c.parentId);
-      if (parentThread === void 0) {
-        if (!threads.has(c.id)) {
-          threads.set(c.id, {
-            root: c,
-            replies: [],
-            isInline: c.quotedText !== null
-          });
-        }
-        continue;
-      }
-      parentThread.replies.push(c);
-    }
-    const all2 = Array.from(threads.values());
-    for (const t of all2) {
-      t.replies.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-    }
-    all2.sort((a, b) => b.root.createdAt.localeCompare(a.root.createdAt));
-    const inline = [];
-    const discussion = [];
-    for (const t of all2) {
-      if (t.isInline) {
-        inline.push(t);
-      } else {
-        discussion.push(t);
-      }
-    }
-    return { inline, discussion };
-  }
+  /** Render inline threads and the pending selection composer. */
   renderInlineSection(container, threads, ctx, content) {
     const section = container.createDiv({ cls: "lsr-section lsr-inline-section" });
     section.createEl("h3", { cls: "lsr-section-title", text: "Inline comments" });
+    if (this.pendingInlineQuote !== null) {
+      this.renderSelectionComposer(section, this.pendingInlineQuote, ctx);
+    }
     if (threads.length === 0) {
       section.createDiv({ cls: "lsr-empty", text: "No inline comments." });
       return;
@@ -8871,6 +8983,121 @@ var CommentsView = class extends import_obsidian4.ItemView {
       textarea.disabled = false;
     }
   }
+  /** Capture a non-empty, uniquely locatable editor selection for an inline comment. */
+  openSelectionComposer() {
+    const file = this.host.getActiveFile();
+    if (file === null) {
+      new import_obsidian4.Notice("Open the Linear spec note and select text first.");
+      return;
+    }
+    const activeContext = this.host.getActiveContext();
+    if (activeContext === null || this.lastCtx === null || activeContext.projectId !== this.lastCtx.projectId || activeContext.documentContentId !== this.lastCtx.documentContentId) {
+      new import_obsidian4.Notice("Open the matching Linear spec note before commenting on a selection.");
+      return;
+    }
+    const lastLeaf = this.lastMarkdownLeaf;
+    const leaf = lastLeaf?.view instanceof import_obsidian4.MarkdownView && lastLeaf.view.file?.path === file.path ? lastLeaf : this.host.app.workspace.getLeavesOfType("markdown").find(
+      (candidate) => candidate.view instanceof import_obsidian4.MarkdownView && candidate.view.file?.path === file.path
+    );
+    if (leaf === void 0 || !(leaf.view instanceof import_obsidian4.MarkdownView)) {
+      new import_obsidian4.Notice("Open the Linear spec note in an editor and select text first.");
+      return;
+    }
+    if (leaf.view.getMode() !== "source") {
+      new import_obsidian4.Notice("Switch the Linear spec note to editing mode to comment on a selection.");
+      return;
+    }
+    const selection = leaf.view.editor.getSelection();
+    const quote = toLinearQuote(selection);
+    if (quote.length === 0) {
+      new import_obsidian4.Notice("Select some text in the spec before commenting.");
+      return;
+    }
+    const matches = findAllInMarkdown(leaf.view.editor.getValue(), quote);
+    if (matches.length === 0) {
+      new import_obsidian4.Notice("Could not map the selection to plain text for a Linear anchor.");
+      return;
+    }
+    if (matches.length > 1) {
+      new import_obsidian4.Notice("This text appears more than once. Select a longer, unique passage.");
+      return;
+    }
+    this.pendingInlineQuote = quote;
+    this.pendingInlineFilePath = file.path;
+    this.renderFilteredBody();
+    this.bodyEl?.querySelector(".lsr-selection-comment-input")?.focus();
+  }
+  renderSelectionComposer(container, quote, ctx) {
+    const composer = container.createDiv({ cls: "lsr-selection-composer" });
+    composer.createDiv({ cls: "lsr-selection-quote", text: quote });
+    const textarea = composer.createEl("textarea", {
+      cls: "lsr-reply-input lsr-selection-comment-input",
+      attr: { placeholder: "Comment on this text\u2026", rows: "3" }
+    });
+    const actions = composer.createDiv({ cls: "lsr-selection-actions" });
+    const cancel = actions.createEl("button", {
+      cls: "lsr-btn",
+      text: "Cancel",
+      attr: { type: "button" }
+    });
+    cancel.addEventListener("click", () => {
+      this.pendingInlineQuote = null;
+      this.pendingInlineFilePath = null;
+      this.renderFilteredBody();
+    });
+    const submit = actions.createEl("button", {
+      cls: "lsr-btn lsr-selection-submit",
+      text: "Comment",
+      attr: { type: "button" }
+    });
+    submit.addEventListener("click", () => {
+      const filePath = this.pendingInlineFilePath;
+      if (filePath === null) {
+        new import_obsidian4.Notice("The selected note is no longer available. Re-select the text.");
+        return;
+      }
+      void this.submitSelectionComment(textarea, submit, quote, filePath, ctx);
+    });
+  }
+  async submitSelectionComment(textarea, button, quote, filePath, ctx) {
+    const body = textarea.value.trim();
+    if (body.length === 0) {
+      new import_obsidian4.Notice("Comment cannot be empty.");
+      return;
+    }
+    const activeFile = this.host.getActiveFile();
+    const activeContext = this.host.getActiveContext();
+    if (activeFile !== null && activeFile.path !== filePath || activeContext !== null && activeContext.documentContentId !== ctx.documentContentId) {
+      new import_obsidian4.Notice("The active note changed. Re-select text in the matching Linear spec.");
+      return;
+    }
+    const currentLeaf = this.host.app.workspace.getLeavesOfType("markdown").find(
+      (candidate) => candidate.view instanceof import_obsidian4.MarkdownView && candidate.view.file?.path === filePath
+    );
+    if (currentLeaf === void 0 || !(currentLeaf.view instanceof import_obsidian4.MarkdownView) || findAllInMarkdown(currentLeaf.view.editor.getValue(), quote).length !== 1) {
+      new import_obsidian4.Notice("The selected text changed or is no longer unique in the spec.");
+      return;
+    }
+    button.disabled = true;
+    textarea.disabled = true;
+    try {
+      const created = await createThread(
+        this.host.app,
+        this.host.getSecretName(),
+        ctx.documentContentId,
+        body,
+        quote
+      );
+      this.pendingInlineQuote = null;
+      this.pendingInlineFilePath = null;
+      new import_obsidian4.Notice("Inline comment posted.");
+      this.patchNewThreadIntoCache(created);
+    } catch (e) {
+      new import_obsidian4.Notice(errorMessage(e));
+      button.disabled = false;
+      textarea.disabled = false;
+    }
+  }
   /** Render the top-of-discussion composer for creating a brand-new thread. */
   renderNewThreadComposer(container, ctx) {
     const box = container.createDiv({ cls: "lsr-reply-box lsr-new-thread-box" });
@@ -8922,33 +9149,26 @@ var CommentsView = class extends import_obsidian4.ItemView {
       void this.refresh();
       return;
     }
-    const thread = this.allThreads().find((t) => t.root.id === parentId);
-    if (thread === void 0) {
+    const updated = addReply(this.lastThreads, parentId, reply);
+    if (updated === null) {
       void this.refresh();
       return;
     }
-    thread.replies.push(reply);
-    thread.replies.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    this.lastThreads = updated;
     this.renderFilterBar();
     this.renderFilteredBody();
   }
   /**
    * Insert a freshly-posted top-level thread into the cached discussion list
-   * and re-render locally (see {@link patchReplyIntoCache}). The new-thread
-   * composer never sets `quotedText`, so this always creates a discussion
-   * thread; new threads are sorted newest-first, so it is unshifted to match.
+   * and re-render locally (see {@link patchReplyIntoCache}). The API response
+   * determines whether it belongs in the inline or discussion section.
    */
   patchNewThreadIntoCache(created) {
     if (this.lastThreads === null) {
       void this.refresh();
       return;
     }
-    const thread = {
-      root: created,
-      replies: [],
-      isInline: created.quotedText !== null
-    };
-    this.lastThreads.discussion.unshift(thread);
+    this.lastThreads = addThread(this.lastThreads, created);
     this.renderFilterBar();
     this.renderFilteredBody();
   }
@@ -9085,7 +9305,7 @@ var CommentsView = class extends import_obsidian4.ItemView {
     }
     try {
       const ranges = await waitForRenderedMatches(container, quoted);
-      const range = ranges[occurrenceIndex] ?? ranges[0];
+      const range = ranges[occurrenceIndex];
       if (range === void 0) {
         return;
       }
@@ -9110,7 +9330,7 @@ var CommentsView = class extends import_obsidian4.ItemView {
         return;
       }
       const ranges = findAllInRenderedText(container, quoted);
-      const range = ranges[occurrenceIndex] ?? ranges[0];
+      const range = ranges[occurrenceIndex];
       if (range === void 0) {
         return;
       }
@@ -9120,18 +9340,6 @@ var CommentsView = class extends import_obsidian4.ItemView {
     this.activePreviewHighlightWatcher = observer;
   }
 };
-function offsetToPosition(content, offset) {
-  const clamped = Math.max(0, Math.min(offset, content.length));
-  let line = 0;
-  let lineStart = 0;
-  for (let i = 0; i < clamped; i++) {
-    if (content[i] === "\n") {
-      line++;
-      lineStart = i + 1;
-    }
-  }
-  return { line, ch: clamped - lineStart };
-}
 
 // src/settings.ts
 var import_obsidian5 = require("obsidian");

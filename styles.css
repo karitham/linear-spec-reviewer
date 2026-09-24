@@ -191,6 +191,36 @@
   background: var(--background-secondary);
 }
 
+.lsr-selection-composer {
+  border: 1px solid var(--interactive-accent);
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 12px;
+  background: var(--background-secondary);
+}
+
+.lsr-selection-quote {
+  border-left: 3px solid var(--interactive-accent);
+  padding: 4px 8px;
+  margin-bottom: 8px;
+  color: var(--text-muted);
+  font-style: italic;
+  white-space: pre-wrap;
+}
+
+.lsr-selection-comment-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 8px;
+}
+
+.lsr-selection-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .lsr-thread-resolved {
   opacity: 0.72;
 }

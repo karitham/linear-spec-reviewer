@@ -55,7 +55,9 @@ Data flows: commands/view → `linear/queries.ts` → `linear/gql.ts` → Linear
 | `render/frontmatter.ts` | `buildFrontmatter()` — hand-rolled YAML (no yaml lib), always double-quotes scalars via `yamlString()`. |
 | `render/overview.ts` | `buildNote()` = frontmatter + body. `stripLinearTags()` (defensive), `sanitizeFileName()`. |
 | `commands.ts` | `ImportUrlModal`, `ProjectSuggestModal` (debounced live search), `writeProjectNote()`, `importByUrl`/`importByProject`, `openBrowseModal`. Host interface `CommandHost`. |
-| `view/CommentsView.ts` | `CommentsView extends ItemView` — grouping, rendering, reply/new-thread, and click-to-scroll from an inline comment's `quotedText` to the note (`buildStripped`/`findInMarkdown`/`scrollEditorToQuotedText`). Host interface `CommentsHost`. |
+| `anchors.ts` | Pure quote projection and resolution: selected Markdown → Linear `quotedText`, quote → all raw Markdown ranges, and raw offset → editor position. |
+| `threads.ts` | Pure comment-thread grouping, ordering, and immutable cache updates. `CommentThread.kind` distinguishes inline from discussion threads. |
+| `view/CommentsView.ts` | `CommentsView extends ItemView` — panel rendering, selection composer, editor navigation, and UI orchestration over `anchors.ts` / `threads.ts`. Host interface `CommentsHost`. |
 | `settings.ts` | `LinearSettingTab` with `SecretComponent`. Host interface `SettingsHost`. Hard-guards secret-storage availability. |
 | `main.ts` | `LinearSpecReviewPlugin` implements all three host interfaces, registers view + 3 commands, reads active-note context from frontmatter, exposes `getActiveFile()` for scroll-to-anchor. |
 
@@ -143,39 +145,35 @@ linear_synced_at`. The panel only activates for the active note when
 
 ## Feature: scroll-to-anchor on inline comment click (IMPLEMENTED)
 
-**Status: implemented and verified.** Clicking the `quotedText` block of an inline comment
-in the panel scrolls the editor to the anchored text and selects it. All logic lives in
-`view/CommentsView.ts` and uses **only** Obsidian's stable `Editor` API — no CM6 internals.
+**Status: implemented.** Clicking the `quotedText` block of an inline comment in the panel
+locates it in the note, scrolls the editor, and selects the matching range. Pure Markdown
+projection and range mapping live in `anchors.ts`; Obsidian editor and Reading View interaction
+stay in `view/CommentsView.ts`.
 
 ### What Linear stores (the matching problem)
 
-`Comment.quotedText` is **the only** anchor mechanism in the entire Linear GraphQL schema.
-There is no character offset, block ID, ProseMirror range, or any positional field, so the
-match must be done client-side by string search. Additionally, `quotedText` is stored as
-**plain text** with markdown syntax stripped (no backticks, no `**bold**`, no `\[escaped\]`,
-smart quotes normalized), while the note on disk is raw markdown. A plain `indexOf` only
-works for snippets with no inline formatting; anything spanning code/emphasis needs a
-position-preserving stripper.
+For project-overview comments, the public GraphQL contract uses `quotedText` as the anchor.
+It does not provide a character offset or relative position to this integration, so matching
+is client-side string search. Linear returns quotes as plain text while the imported note is
+raw Markdown; `anchors.ts` projects inline formatting and escapes while preserving raw offsets.
+Quote matches can be missing or ambiguous; callers must not silently choose among duplicates.
 
 ### How it works (the shipped design)
 
-1. **`getActiveFile()`** on `CommentsHost` (implemented in `main.ts`) returns the active
-   `.md` `TFile`. The note is read fresh from the vault via `app.vault.read(file)` — we
-   match against the same on-disk markdown the reviewer sees, not the CM6 buffer.
-2. **`buildStripped(raw)`** builds a plain-text projection of the raw markdown plus a
-   parallel `rawOffsets[]` array mapping every stripped char back to its raw offset (with a
-   trailing sentinel = `raw.length` for exclusive-end resolution). Transforms: drop backtick
-   runs, drop `*`/`_` emphasis runs (≤3 chars), backslash-unescape (mapped to the backslash
-   offset so the range covers both chars), normalize smart quotes/dashes/ellipsis to ASCII.
-3. **`findInMarkdown(raw, needle)`** → `{ from, to } | null`. Fast path: verbatim `indexOf`.
-   Slow path: normalize the needle, `indexOf` in the stripped projection, map boundaries
-   back through `rawOffsets`.
-4. **`offsetToPosition(content, offset)`** converts a byte offset to Obsidian `{ line, ch }`.
-5. **`scrollEditorToQuotedText(quoted)`** wires it together: get `MarkdownView` via
-   `app.workspace.getActiveViewOfType(MarkdownView)`, read the file, `findInMarkdown`,
-   `setActiveLeaf(view.leaf, { focus: true })`, then `editor.setSelection(from, to)` +
-   `editor.scrollIntoView({ from, to }, true)`. Not found → `Notice` and leave the editor
-   untouched (expected when the spec was edited after the comment was anchored).
+1. **`toLinearQuote(selection)`** in `anchors.ts` converts selected Markdown to the plain-text
+   quote sent to Linear. The selection composer currently requires a source/editing view so
+   it cannot accidentally use a stale editor selection from Reading View.
+2. **`findAllInMarkdown(raw, quote)`** projects Markdown to plain text and returns every
+   matching `{ from, to }` range. It maps each projected character back to the raw offset,
+   preserves underscores in ordinary words, normalizes supported punctuation, and includes
+   overlapping matches so ambiguity checks are accurate.
+3. Selection-based comment creation requires one unique match both when opening the composer
+   and immediately before posting. The mutation passes that quote as `quotedText`; Linear's
+   response determines whether the new root is rendered as inline or discussion.
+4. **`offsetToPosition(content, offset)`** converts raw UTF-16 offsets to Obsidian `{ line, ch }`.
+5. **`scrollEditorToQuotedText(quoted)`** gets the matching Markdown leaf, resolves the quote
+   against the current note snapshot, focuses that leaf, then selects and scrolls the range.
+   Missing quote → `Notice` and leave the editor untouched.
 
 The click handler is on `.lsr-quoted.lsr-quoted-clickable` in `renderInlineSection`.
 

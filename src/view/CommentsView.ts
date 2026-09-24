@@ -11,8 +11,16 @@ import {
   LinearComment,
   CommentThread,
   GroupedComments,
+  LinearSpecContext,
   LINEAR_COMMENTS_VIEW,
 } from "../types";
+import {
+  findAllInMarkdown,
+  normalizeQuoteText,
+  offsetToPosition,
+  toLinearQuote,
+} from "../anchors";
+import { addReply, addThread, groupComments } from "../threads";
 import {
   getProjectComments,
   createThread,
@@ -28,11 +36,7 @@ export interface CommentsHost {
   renderCommentImages(el: HTMLElement, screenshots: ReadonlyMap<string, string>): () => void;
   getSecretName(): string;
   /** Returns the active note's linear context, or null if the active file is not a linear-linked note. */
-  getActiveContext(): {
-    projectId: string;
-    documentContentId: string;
-    projectName: string;
-  } | null;
+  getActiveContext(): LinearSpecContext | null;
   /** The active markdown note file, or null when no markdown file is active. */
   getActiveFile(): import("obsidian").TFile | null;
   /**
@@ -42,6 +46,8 @@ export interface CommentsHost {
    */
   notifyCommentsLoaded(projectId: string | null): void;
 }
+
+type CommentContext = LinearSpecContext;
 
 /** Extract a human message from an unknown thrown value. */
 function errorMessage(e: unknown): string {
@@ -134,152 +140,6 @@ function formatTimestamp(iso: string): string {
   return d.toLocaleString();
 }
 
-/** Normalize smart quotes/apostrophes and dashes to their ASCII equivalents. */
-function normalizeChar(ch: string): string {
-  switch (ch) {
-    case "\u2018": // ‘
-    case "\u2019": // ’
-    case "\u201B": // ‛
-      return "'";
-    case "\u201C": // “
-    case "\u201D": // ”
-    case "\u201F": // ‟
-      return '"';
-    case "\u2013": // – en dash
-    case "\u2014": // — em dash
-      return "-";
-    case "\u2026": // … ellipsis
-      return ".";
-    default:
-      return ch;
-  }
-}
-
-/**
- * Build a plain-text projection of raw markdown, stripping the inline syntax
- * that Linear removes when it stores `quotedText`, while recording, for each
- * character in the stripped output, its originating offset in `raw`.
- *
- * Handled transforms (position-preserving via `rawOffsets`):
- * - inline code backticks (` `` `, ` ``` ` runs) are dropped
- * - emphasis runs of `*`, `_` (up to 3 chars, e.g. `***`) are dropped
- * - backslash escapes (`\[`, `\*`, …) keep the escaped char, drop the slash
- * - smart quotes/dashes/ellipsis are normalized to ASCII
- *
- * `rawOffsets[i]` is the index in `raw` where `stripped[i]` began. A trailing
- * sentinel equal to `raw.length` is appended so a match ending at the final
- * stripped char can resolve its exclusive `to` offset.
- */
-function buildStripped(raw: string): { stripped: string; rawOffsets: number[] } {
-  let stripped = "";
-  const rawOffsets: number[] = [];
-  let i = 0;
-  const n = raw.length;
-
-  while (i < n) {
-    const ch = raw[i];
-
-    // Backtick run: inline code fence markers are stripped from quotedText.
-    if (ch === "`") {
-      let j = i + 1;
-      while (j < n && raw[j] === "`") {
-        j++;
-      }
-      i = j;
-      continue;
-    }
-
-    // Emphasis run of * or _ (bold/italic markers), up to 3 chars.
-    if (ch === "*" || ch === "_") {
-      let j = i + 1;
-      while (j < n && raw[j] === ch && j - i < 3) {
-        j++;
-      }
-      i = j;
-      continue;
-    }
-
-    // Backslash escape: drop the slash, keep (normalized) next char verbatim.
-    if (ch === "\\" && i + 1 < n) {
-      const next = normalizeChar(raw[i + 1]);
-      stripped += next;
-      rawOffsets.push(i); // map to the backslash so the range covers both
-      i += 2;
-      continue;
-    }
-
-    stripped += normalizeChar(ch);
-    rawOffsets.push(i);
-    i++;
-  }
-
-  rawOffsets.push(n); // sentinel for exclusive end resolution
-  return { stripped, rawOffsets };
-}
-
-/**
- * Locate every occurrence of `needle` (Linear plain-text `quotedText`) inside
- * `raw` markdown and return their `{ from, to }` byte offsets in `raw`.
- *
- * A single, consistent basis is used so occurrences are not double-counted:
- * - Fast path: collect all verbatim `indexOf` matches (covers snippets with no
- *   inline markdown). If any are found, those are returned.
- * - Slow path: build the stripped projection once, collect all matches there,
- *   and map each match's boundaries back to raw offsets via `rawOffsets`.
- *
- * Returns an empty array when there is no match. Matches are ordered by
- * position and are non-overlapping (search advances past each hit).
- */
-function findAllInMarkdown(
-  raw: string,
-  needle: string
-): { from: number; to: number }[] {
-  if (needle.length === 0) {
-    return [];
-  }
-
-  // Fast path: all verbatim substrings in the raw markdown.
-  const verbatim: { from: number; to: number }[] = [];
-  let searchFrom = 0;
-  for (;;) {
-    const at = raw.indexOf(needle, searchFrom);
-    if (at === -1) {
-      break;
-    }
-    verbatim.push({ from: at, to: at + needle.length });
-    searchFrom = at + needle.length;
-  }
-  if (verbatim.length > 0) {
-    return verbatim;
-  }
-
-  // Slow path: normalize both sides and search the stripped projection.
-  const { stripped, rawOffsets } = buildStripped(raw);
-  let normalizedNeedle = "";
-  for (const ch of needle) {
-    normalizedNeedle += normalizeChar(ch);
-  }
-  if (normalizedNeedle.length === 0) {
-    return [];
-  }
-
-  const matches: { from: number; to: number }[] = [];
-  let strippedFrom = 0;
-  for (;;) {
-    const idx = stripped.indexOf(normalizedNeedle, strippedFrom);
-    if (idx === -1) {
-      break;
-    }
-    const from = rawOffsets[idx];
-    const to = rawOffsets[idx + normalizedNeedle.length];
-    if (from !== undefined && to !== undefined) {
-      matches.push({ from, to });
-    }
-    strippedFrom = idx + normalizedNeedle.length;
-  }
-  return matches;
-}
-
 /**
  * Locate every occurrence of `needle` inside the *rendered* text of `container`
  * (e.g. a note's Reading View DOM) and return each as a `Range`.
@@ -348,26 +208,16 @@ function findAllInRenderedText(container: HTMLElement, needle: string): Range[] 
       if (range !== null) {
         ranges.push(range);
       }
-      searchFrom = at + term.length;
+      searchFrom = at + 1;
     }
     return ranges;
   }
 
-  const verbatim = collect(text, needle);
-  if (verbatim.length > 0) {
-    return verbatim;
-  }
-
-  // Fallback: normalize smart quotes/dashes/ellipsis (1:1 char mapping, so
-  // indices still line up with the original text/node offsets).
-  let normalizedText = "";
-  for (const ch of text) {
-    normalizedText += normalizeChar(ch);
-  }
-  let normalizedNeedle = "";
-  for (const ch of needle) {
-    normalizedNeedle += normalizeChar(ch);
-  }
+  // Normalization is one-to-one, so the resulting offsets still line up with
+  // the original text nodes. Search normalized text to count equivalent forms
+  // together rather than hiding punctuation-equivalent duplicate occurrences.
+  const normalizedText = normalizeQuoteText(text);
+  const normalizedNeedle = normalizeQuoteText(needle);
   if (normalizedNeedle.length === 0) {
     return [];
   }
@@ -436,12 +286,17 @@ export class CommentsView extends ItemView {
     for (const dispose of this.imageDisposers.splice(0)) dispose();
   }
   private headerTitleEl: HTMLElement | null = null;
+  /** Last markdown leaf focused before the comments panel took focus. */
+  private lastMarkdownLeaf: WorkspaceLeaf | null = null;
   /**
    * Raw markdown of the active note captured at the last refresh. Occurrence
    * counts and click navigation both resolve against this snapshot so they stay
    * consistent between the rendered badges and clicks. Refreshed by `refresh()`.
    */
   private noteContentSnapshot: string | null = null;
+  /** Plain-text quote captured from the active editor for a pending inline comment. */
+  private pendingInlineQuote: string | null = null;
+  private pendingInlineFilePath: string | null = null;
   /**
    * Next occurrence index to reveal for a given inline comment, keyed by comment
    * id. Advances (and wraps) on each click so repeated clicks cycle through all
@@ -469,9 +324,7 @@ export class CommentsView extends ItemView {
   /** Threads last fetched from Linear, cached so filter toggles re-render locally. */
   private lastThreads: GroupedComments | null = null;
   /** Context for the cached threads (used by section renderers). */
-  private lastCtx:
-    | { projectId: string; documentContentId: string; projectName: string }
-    | null = null;
+  private lastCtx: CommentContext | null = null;
   /** Container for the filter bar, rebuilt whenever filters or data change. */
   private filterBarEl: HTMLElement | null = null;
   /** Statuses currently hidden. Empty = show all. */
@@ -505,6 +358,17 @@ export class CommentsView extends ItemView {
   }
 
   async onOpen(): Promise<void> {
+    const activeLeaf = this.host.app.workspace.activeLeaf;
+    if (activeLeaf?.view instanceof MarkdownView) {
+      this.lastMarkdownLeaf = activeLeaf;
+    }
+    this.registerEvent(
+      this.host.app.workspace.on("active-leaf-change", (leaf) => {
+        if (leaf?.view instanceof MarkdownView) {
+          this.lastMarkdownLeaf = leaf;
+        }
+      })
+    );
     this.renderShell();
     await this.refresh();
   }
@@ -560,6 +424,19 @@ export class CommentsView extends ItemView {
       this.focusNewThreadComposer();
     });
 
+    const selectionBtn = actions.createEl("button", {
+      cls: "lsr-btn lsr-selection-comment-btn",
+      attr: {
+        "aria-label": "Comment on selection",
+        title: "Comment on selection",
+        type: "button",
+      },
+    });
+    setIcon(selectionBtn, "message-square-plus");
+    selectionBtn.addEventListener("click", () => {
+      void this.openSelectionComposer();
+    });
+
     // Filter bar is (re)populated by renderFilterBar; empty until data loads.
     this.filterBarEl = sticky.createDiv({ cls: "lsr-filter-bar" });
 
@@ -580,6 +457,8 @@ export class CommentsView extends ItemView {
 
     // Re-rendering invalidates prior occurrence navigation state and cache.
     this.noteContentSnapshot = null;
+    this.pendingInlineQuote = null;
+    this.pendingInlineFilePath = null;
     this.occurrenceIndex.clear();
     this.activePreviewHighlightWatcher?.disconnect();
     this.activePreviewHighlightWatcher = null;
@@ -649,7 +528,7 @@ export class CommentsView extends ItemView {
       }
     }
 
-    this.lastThreads = this.groupComments(comments);
+    this.lastThreads = groupComments(comments);
     this.lastCtx = ctx;
     this.renderFilterBar();
     this.renderFilteredBody();
@@ -859,82 +738,19 @@ export class CommentsView extends ItemView {
     this.renderDiscussionSection(body, discussion, ctx);
   }
 
-  /**
-   * Group a flat list of comments into inline/discussion threads.
-   *
-   * - Roots are comments with parentId === null (or whose parent is missing
-   *   from the set, treated defensively as their own root).
-   * - Replies attach to the root referenced by parentId.
-   * - Replies are sorted by createdAt ascending; threads by root.createdAt
-   *   descending.
-   */
-  private groupComments(comments: LinearComment[]): GroupedComments {
-    const byId = new Map<string, LinearComment>();
-    for (const c of comments) {
-      byId.set(c.id, c);
-    }
-
-    const threads = new Map<string, CommentThread>();
-
-    // Seed roots first so replies can attach in a single subsequent pass.
-    for (const c of comments) {
-      const isRoot = c.parentId === null || !byId.has(c.parentId);
-      if (isRoot) {
-        threads.set(c.id, {
-          root: c,
-          replies: [],
-          isInline: c.quotedText !== null,
-        });
-      }
-    }
-
-    for (const c of comments) {
-      if (c.parentId === null) {
-        continue;
-      }
-      const parentThread = threads.get(c.parentId);
-      if (parentThread === undefined) {
-        // Parent exists in the set but is itself a reply, or the root was
-        // already claimed; if we somehow have no thread, promote defensively.
-        if (!threads.has(c.id)) {
-          threads.set(c.id, {
-            root: c,
-            replies: [],
-            isInline: c.quotedText !== null,
-          });
-        }
-        continue;
-      }
-      parentThread.replies.push(c);
-    }
-
-    const all = Array.from(threads.values());
-    for (const t of all) {
-      t.replies.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-    }
-    all.sort((a, b) => b.root.createdAt.localeCompare(a.root.createdAt));
-
-    const inline: CommentThread[] = [];
-    const discussion: CommentThread[] = [];
-    for (const t of all) {
-      if (t.isInline) {
-        inline.push(t);
-      } else {
-        discussion.push(t);
-      }
-    }
-
-    return { inline, discussion };
-  }
-
+  /** Render inline threads and the pending selection composer. */
   private renderInlineSection(
     container: HTMLElement,
     threads: CommentThread[],
-    ctx: { projectId: string; documentContentId: string; projectName: string },
+    ctx: CommentContext,
     content: string | null
   ): void {
     const section = container.createDiv({ cls: "lsr-section lsr-inline-section" });
     section.createEl("h3", { cls: "lsr-section-title", text: "Inline comments" });
+
+    if (this.pendingInlineQuote !== null) {
+      this.renderSelectionComposer(section, this.pendingInlineQuote, ctx);
+    }
 
     if (threads.length === 0) {
       section.createDiv({ cls: "lsr-empty", text: "No inline comments." });
@@ -980,7 +796,7 @@ export class CommentsView extends ItemView {
   private renderDiscussionSection(
     container: HTMLElement,
     threads: CommentThread[],
-    ctx: { projectId: string; documentContentId: string; projectName: string }
+    ctx: CommentContext
   ): void {
     const section = container.createDiv({
       cls: "lsr-section lsr-discussion-section",
@@ -1006,7 +822,7 @@ export class CommentsView extends ItemView {
   private renderThreadBodies(
     threadEl: HTMLElement,
     thread: CommentThread,
-    ctx: { projectId: string; documentContentId: string; projectName: string }
+    ctx: CommentContext
   ): void {
     const resolved = thread.root.resolvedAt !== null;
     if (resolved) {
@@ -1063,7 +879,7 @@ export class CommentsView extends ItemView {
   private renderReplyBox(
     threadEl: HTMLElement,
     parentId: string,
-    ctx: { projectId: string; documentContentId: string; projectName: string }
+    ctx: CommentContext
   ): void {
     const box = threadEl.createDiv({ cls: "lsr-reply-box" });
     const textarea = box.createEl("textarea", {
@@ -1085,7 +901,7 @@ export class CommentsView extends ItemView {
     textarea: HTMLTextAreaElement,
     button: HTMLButtonElement,
     parentId: string,
-    ctx: { projectId: string; documentContentId: string; projectName: string }
+    ctx: CommentContext
   ): Promise<void> {
     const body = textarea.value.trim();
     if (body.length === 0) {
@@ -1112,10 +928,169 @@ export class CommentsView extends ItemView {
     }
   }
 
+  /** Capture a non-empty, uniquely locatable editor selection for an inline comment. */
+  private openSelectionComposer(): void {
+    const file = this.host.getActiveFile();
+    if (file === null) {
+      new Notice("Open the Linear spec note and select text first.");
+      return;
+    }
+
+    const activeContext = this.host.getActiveContext();
+    if (
+      activeContext === null ||
+      this.lastCtx === null ||
+      activeContext.projectId !== this.lastCtx.projectId ||
+      activeContext.documentContentId !== this.lastCtx.documentContentId
+    ) {
+      new Notice("Open the matching Linear spec note before commenting on a selection.");
+      return;
+    }
+
+    const lastLeaf = this.lastMarkdownLeaf;
+    const leaf =
+      lastLeaf?.view instanceof MarkdownView && lastLeaf.view.file?.path === file.path
+        ? lastLeaf
+        : this.host.app.workspace.getLeavesOfType("markdown").find((candidate) =>
+        candidate.view instanceof MarkdownView &&
+        candidate.view.file?.path === file.path
+      );
+    if (leaf === undefined || !(leaf.view instanceof MarkdownView)) {
+      new Notice("Open the Linear spec note in an editor and select text first.");
+      return;
+    }
+    if (leaf.view.getMode() !== "source") {
+      new Notice("Switch the Linear spec note to editing mode to comment on a selection.");
+      return;
+    }
+
+    const selection = leaf.view.editor.getSelection();
+    const quote = toLinearQuote(selection);
+    if (quote.length === 0) {
+      new Notice("Select some text in the spec before commenting.");
+      return;
+    }
+
+    const matches = findAllInMarkdown(leaf.view.editor.getValue(), quote);
+    if (matches.length === 0) {
+      new Notice("Could not map the selection to plain text for a Linear anchor.");
+      return;
+    }
+    if (matches.length > 1) {
+      new Notice("This text appears more than once. Select a longer, unique passage.");
+      return;
+    }
+
+    this.pendingInlineQuote = quote;
+    this.pendingInlineFilePath = file.path;
+    this.renderFilteredBody();
+    this.bodyEl
+      ?.querySelector<HTMLTextAreaElement>(".lsr-selection-comment-input")
+      ?.focus();
+  }
+
+  private renderSelectionComposer(
+    container: HTMLElement,
+    quote: string,
+    ctx: CommentContext
+  ): void {
+    const composer = container.createDiv({ cls: "lsr-selection-composer" });
+    composer.createDiv({ cls: "lsr-selection-quote", text: quote });
+    const textarea = composer.createEl("textarea", {
+      cls: "lsr-reply-input lsr-selection-comment-input",
+      attr: { placeholder: "Comment on this text…", rows: "3" },
+    });
+    const actions = composer.createDiv({ cls: "lsr-selection-actions" });
+    const cancel = actions.createEl("button", {
+      cls: "lsr-btn",
+      text: "Cancel",
+      attr: { type: "button" },
+    });
+    cancel.addEventListener("click", () => {
+      this.pendingInlineQuote = null;
+      this.pendingInlineFilePath = null;
+      this.renderFilteredBody();
+    });
+
+    const submit = actions.createEl("button", {
+      cls: "lsr-btn lsr-selection-submit",
+      text: "Comment",
+      attr: { type: "button" },
+    });
+    submit.addEventListener("click", () => {
+      const filePath = this.pendingInlineFilePath;
+      if (filePath === null) {
+        new Notice("The selected note is no longer available. Re-select the text.");
+        return;
+      }
+      void this.submitSelectionComment(textarea, submit, quote, filePath, ctx);
+    });
+  }
+
+  private async submitSelectionComment(
+    textarea: HTMLTextAreaElement,
+    button: HTMLButtonElement,
+    quote: string,
+    filePath: string,
+    ctx: CommentContext
+  ): Promise<void> {
+    const body = textarea.value.trim();
+    if (body.length === 0) {
+      new Notice("Comment cannot be empty.");
+      return;
+    }
+
+    const activeFile = this.host.getActiveFile();
+    const activeContext = this.host.getActiveContext();
+    if (
+      (activeFile !== null && activeFile.path !== filePath) ||
+      (activeContext !== null &&
+        activeContext.documentContentId !== ctx.documentContentId)
+    ) {
+      new Notice("The active note changed. Re-select text in the matching Linear spec.");
+      return;
+    }
+
+    const currentLeaf = this.host.app.workspace
+      .getLeavesOfType("markdown")
+      .find((candidate) =>
+        candidate.view instanceof MarkdownView &&
+        candidate.view.file?.path === filePath
+      );
+    if (
+      currentLeaf === undefined ||
+      !(currentLeaf.view instanceof MarkdownView) ||
+      findAllInMarkdown(currentLeaf.view.editor.getValue(), quote).length !== 1
+    ) {
+      new Notice("The selected text changed or is no longer unique in the spec.");
+      return;
+    }
+
+    button.disabled = true;
+    textarea.disabled = true;
+    try {
+      const created = await createThread(
+        this.host.app,
+        this.host.getSecretName(),
+        ctx.documentContentId,
+        body,
+        quote
+      );
+      this.pendingInlineQuote = null;
+      this.pendingInlineFilePath = null;
+      new Notice("Inline comment posted.");
+      this.patchNewThreadIntoCache(created);
+    } catch (e) {
+      new Notice(errorMessage(e));
+      button.disabled = false;
+      textarea.disabled = false;
+    }
+  }
+
   /** Render the top-of-discussion composer for creating a brand-new thread. */
   private renderNewThreadComposer(
     container: HTMLElement,
-    ctx: { projectId: string; documentContentId: string; projectName: string }
+    ctx: CommentContext
   ): void {
     const box = container.createDiv({ cls: "lsr-reply-box lsr-new-thread-box" });
     const textarea = box.createEl("textarea", {
@@ -1136,7 +1111,7 @@ export class CommentsView extends ItemView {
   private async submitNewThread(
     textarea: HTMLTextAreaElement,
     button: HTMLButtonElement,
-    ctx: { projectId: string; documentContentId: string; projectName: string }
+    ctx: CommentContext
   ): Promise<void> {
     const body = textarea.value.trim();
     if (body.length === 0) {
@@ -1174,13 +1149,12 @@ export class CommentsView extends ItemView {
       void this.refresh();
       return;
     }
-    const thread = this.allThreads().find((t) => t.root.id === parentId);
-    if (thread === undefined) {
+    const updated = addReply(this.lastThreads, parentId, reply);
+    if (updated === null) {
       void this.refresh();
       return;
     }
-    thread.replies.push(reply);
-    thread.replies.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    this.lastThreads = updated;
 
     this.renderFilterBar();
     this.renderFilteredBody();
@@ -1188,21 +1162,15 @@ export class CommentsView extends ItemView {
 
   /**
    * Insert a freshly-posted top-level thread into the cached discussion list
-   * and re-render locally (see {@link patchReplyIntoCache}). The new-thread
-   * composer never sets `quotedText`, so this always creates a discussion
-   * thread; new threads are sorted newest-first, so it is unshifted to match.
+   * and re-render locally (see {@link patchReplyIntoCache}). The API response
+   * determines whether it belongs in the inline or discussion section.
    */
   private patchNewThreadIntoCache(created: LinearComment): void {
     if (this.lastThreads === null) {
       void this.refresh();
       return;
     }
-    const thread: CommentThread = {
-      root: created,
-      replies: [],
-      isInline: created.quotedText !== null,
-    };
-    this.lastThreads.discussion.unshift(thread);
+    this.lastThreads = addThread(this.lastThreads, created);
 
     this.renderFilterBar();
     this.renderFilteredBody();
@@ -1387,7 +1355,7 @@ export class CommentsView extends ItemView {
 
     try {
       const ranges = await waitForRenderedMatches(container, quoted);
-      const range = ranges[occurrenceIndex] ?? ranges[0];
+      const range = ranges[occurrenceIndex];
       if (range === undefined) {
         return;
       }
@@ -1417,7 +1385,7 @@ export class CommentsView extends ItemView {
         return;
       }
       const ranges = findAllInRenderedText(container, quoted);
-      const range = ranges[occurrenceIndex] ?? ranges[0];
+      const range = ranges[occurrenceIndex];
       if (range === undefined) {
         return;
       }
@@ -1428,25 +1396,4 @@ export class CommentsView extends ItemView {
     observer.observe(container, { childList: true, subtree: true });
     this.activePreviewHighlightWatcher = observer;
   }
-}
-
-/**
- * Convert a byte offset into `content` to an Obsidian `{ line, ch }` position.
- * `line` and `ch` are both zero-based; `ch` counts UTF-16 code units within
- * the line, matching what the Obsidian `Editor` API expects.
- */
-function offsetToPosition(
-  content: string,
-  offset: number
-): { line: number; ch: number } {
-  const clamped = Math.max(0, Math.min(offset, content.length));
-  let line = 0;
-  let lineStart = 0;
-  for (let i = 0; i < clamped; i++) {
-    if (content[i] === "\n") {
-      line++;
-      lineStart = i + 1;
-    }
-  }
-  return { line, ch: clamped - lineStart };
 }

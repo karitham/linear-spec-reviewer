@@ -12,6 +12,7 @@ import {
   LINEAR_COMMENTS_VIEW,
   FM_PROJECT_ID,
   FM_DOCUMENT_CONTENT_ID,
+  LinearSpecContext,
 } from "./types";
 import { assertSecretStorage } from "./linear/gql";
 import { AssetStore } from "./linear/assets";
@@ -206,11 +207,7 @@ export default class LinearSpecReviewPlugin
   }
 
   /** Reads the active markdown note's Linear context from its frontmatter. */
-  getActiveContext(): {
-    projectId: string;
-    documentContentId: string;
-    projectName: string;
-  } | null {
+  getActiveContext(): LinearSpecContext | null {
     const file = this.app.workspace.getActiveFile();
     if (file === null || file.extension !== "md") {
       return null;

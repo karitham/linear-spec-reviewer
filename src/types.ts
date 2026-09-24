@@ -7,6 +7,13 @@ export interface LinearUserRef {
   displayName?: string | null;
 }
 
+/** Linear identity and display metadata carried by an imported spec note. */
+export interface LinearSpecContext {
+  projectId: string;
+  documentContentId: string;
+  projectName: string;
+}
+
 /** A Linear project as returned by `searchProjects` (browse/URL resolution). */
 export interface ProjectSearchResult {
   id: string;
@@ -63,17 +70,25 @@ export interface LinearComment {
   botActorName: string | null;
 }
 
-/** A thread = a root comment plus its ordered replies. */
-export interface CommentThread {
-  root: LinearComment;
+/** An inline thread has a non-null Linear quote on its root. */
+export interface InlineCommentThread {
+  kind: "inline";
+  root: LinearComment & { quotedText: string };
   replies: LinearComment[];
-  /** True when root.quotedText != null (anchored to overview text). */
-  isInline: boolean;
 }
 
+/** A discussion thread has no quote on its root. */
+export interface DiscussionCommentThread {
+  kind: "discussion";
+  root: LinearComment & { quotedText: null };
+  replies: LinearComment[];
+}
+
+export type CommentThread = InlineCommentThread | DiscussionCommentThread;
+
 export interface GroupedComments {
-  inline: CommentThread[];
-  discussion: CommentThread[];
+  inline: InlineCommentThread[];
+  discussion: DiscussionCommentThread[];
 }
 
 export interface PluginSettings {
